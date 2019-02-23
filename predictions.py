@@ -54,7 +54,7 @@ graph = Graph("bolt://localhost:7687", auth=("neo4j", "neo"))
 # end::py2neo[]
 
 train_existing_links = graph.run("""
-MATCH (author:Author)-[:CO_AUTHOR_EARLY]-(other:Author)
+MATCH (author:Author)-[:CO_AUTHOR_EARLY]->(other:Author)
 RETURN id(author) AS node1, id(other) AS node2, 1 AS label
 """).to_data_frame()
 
@@ -66,12 +66,13 @@ WHERE not((author)-[:CO_AUTHOR_EARLY]-(other))
 RETURN id(author) AS node1, id(other) AS node2, 0 AS label
 """).to_data_frame()
 
+train_missing_links = train_missing_links.drop_duplicates()
 training_df = train_missing_links.append(train_existing_links, ignore_index=True)
 training_df = preprocess_df(training_df)
 training_data = spark.createDataFrame(training_df)
 
 test_existing_links = graph.run("""
-MATCH (author:Author)-[:CO_AUTHOR_LATE]-(other:Author)
+MATCH (author:Author)-[:CO_AUTHOR_LATE]->(other:Author)
 RETURN id(author) AS node1, id(other) AS node2, 1 AS label
 """).to_data_frame()
 
@@ -83,6 +84,7 @@ WHERE not((author)-[:CO_AUTHOR]-(other))
 RETURN id(author) AS node1, id(other) AS node2, 0 AS label
 """).to_data_frame()
 
+test_missing_links = test_missing_links.drop_duplicates()
 test_df = test_missing_links.append(test_existing_links, ignore_index=True)
 test_df = preprocess_df(test_df)
 test_data = spark.createDataFrame(test_df)
@@ -113,10 +115,8 @@ def apply_training_features(training_data):
            CASE WHEN p1.partitionTrain = p2.partitionTrain THEN 1 ELSE 0 END AS samePartition,
            CASE WHEN p1.louvainTrain = p2.louvainTrain THEN 1 ELSE 0 END AS sameLouvain
     """
-    params = {"pairs": [{"node1": row["node1"], "node2": row["node2"]}
-                        for row in training_data.collect()]}
-    training_features = spark.createDataFrame(
-        graph.run(training_features_query, params).to_data_frame())
+    pairs = [{"node1": row["node1"], "node2": row["node2"]} for row in training_data.collect()]
+    training_features = spark.createDataFrame(graph.run(training_features_query, {"pairs": pairs}).to_data_frame())
     return training_data.join(training_features, ["node1", "node2"])
 
 
@@ -143,17 +143,9 @@ def apply_test_features(test_data):
            CASE WHEN p1.partitionTest = p2.partitionTest THEN 1 ELSE 0 END AS samePartition,
            CASE WHEN p1.louvainTest = p2.louvainTest THEN 1 ELSE 0 END AS sameLouvain
     """
-    params = {"pairs": [{"node1": row["node1"], "node2": row["node2"]}
-                        for row in test_data.collect()]}
-    test_features = spark.createDataFrame(
-        graph.run(test_features_query, params).to_data_frame())
+    pairs = [{"node1": row["node1"], "node2": row["node2"]} for row in test_data.collect()]
+    test_features = spark.createDataFrame(graph.run(test_features_query, {"pairs": pairs}).to_data_frame())
     return test_data.join(test_features, ["node1", "node2"])
-
-
-rf_model = model.stages[-1]
-feature_importance = pd.DataFrame({"Feature": fields, "Importance": rf_model.featureImportances})
-print(feature_importance)
-
 
 
 def train_and_evaluate_model(fields, training_data, test_data):
@@ -165,8 +157,35 @@ def train_and_evaluate_model(fields, training_data, test_data):
     print(pd.DataFrame({"Feature": fields, "Importance": rf_model.featureImportances}))
 
 
+def evaluate_model(model, test_data):
+    predictions = model.transform(test_data)
+    labels = [row["label"] for row in predictions.select("label").collect()]
+    preds = [row["probability"][1] for row in predictions.select("probability").collect()]
+    fpr, tpr, threshold = roc_curve(labels, preds)
+    roc_auc = auc(fpr, tpr)
+    return fpr, tpr, roc_auc
+
+
+def train_model(fields, training_data):
+    pipeline = create_pipeline(fields)
+    model = pipeline.fit(training_data)
+    return model
+
+
+from cycler import cycler
+import matplotlib
+
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
+plt.style.use('classic')
+
+
+
 training_data = apply_training_features(training_data)
 test_data = apply_test_features(test_data)
+
+# Evaluating on computer science only
 
 train_and_evaluate_model(["commonAuthors"], training_data, test_data)
 #      Measure     Score
@@ -252,3 +271,98 @@ train_and_evaluate_model(["commonAuthors", "minNeighbours", "maxNeighbours", "to
 # 0   Accuracy  0.921881
 # 1  Precision  0.849239
 # 2     Recall  0.794400
+
+
+# Ones we got wrong
+
+wrong = all_preds[all_preds["label"] != all_preds["prediction"]][all_preds["label"] == 1]
+params = {"pairs": [{"node1": row["node1"], "node2": row["node2"]} for row in wrong.collect()]}
+
+query = """
+UNWIND $pairs AS pair
+MATCH (p1) WHERE id(p1) = pair.node1
+MATCH (p2) WHERE id(p2) = pair.node2
+MATCH (p1)-[rel]-(p2)
+RETURN pair.node1 AS node1, pair.node2 AS node2, rel.year AS year
+"""
+
+wrong_df = graph.run(query, params).to_data_frame()
+wrong_df.groupby("year").size()
+
+all = all_preds[all_preds["label"] == 1]
+params = {"pairs": [{"node1": row["node1"], "node2": row["node2"]} for row in all.collect()]}
+
+all_df = graph.run(query, params).to_data_frame()
+all_df.groupby("year").size()
+
+
+# With the bigger dataset of multiple conferences
+
+basic_model = train_model(["commonAuthors"], training_data)
+
+
+train_and_evaluate_model(
+    ["commonAuthors", "totalNeighbours", "neighboursMeasure", "prefAttachment",
+     "sameLouvain", "minTriangles", "maxTriangles", "minCoefficient", "maxCoefficient",
+     "samePartition", "jaccard"], training_data, test_data)
+
+#      Measure     Score
+# 0   Accuracy  0.987617
+# 1  Precision  0.955964
+# 2     Recall  0.938593
+
+#               Feature  Importance
+# 0       commonAuthors    0.288387
+# 1     totalNeighbours    0.042809
+# 2   neighboursMeasure    0.007885
+# 3      prefAttachment    0.013405
+# 4         sameLouvain    0.272882
+# 5        minTriangles    0.074933
+# 6        maxTriangles    0.051606
+# 7      minCoefficient    0.049566
+# 8      maxCoefficient    0.014578
+# 9       samePartition    0.096045
+# 10            jaccard    0.087902
+
+
+# Plot AUC
+
+def create_roc_plot():
+    fig = plt.figure(figsize=(13, 8))
+    plt.title('ROC Curves')
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.ylabel('True Positive Rate')
+    plt.xlabel('False Positive Rate')
+    plt.rc('axes', prop_cycle=(cycler('color', ['r', 'g', 'b', 'c', 'm', 'y', 'k'])))
+    plt.plot([0, 1], [0, 1], linestyle='--', label='Random score (AUC = 0.50)')
+    return plt, fig
+
+
+def add_curve(plt, title, accuracy_measures):
+    fpr, tpr, roc = accuracy_measures
+    plt.plot(fpr, tpr, label=f"{title} (AUC = {roc:0.2})")
+
+
+plt, fig = create_roc_plot()
+
+all_fields = ["commonAuthors", "minNeighbours", "maxNeighbours", "totalNeighbours",
+              "neighboursMeasure", "prefAttachment", "sameLouvain", "minTriangles",
+              "maxTriangles", "minCoefficient", "maxCoefficient", "samePartition", "jaccard"]
+all_model = train_model(all_fields, training_data)
+add_curve(plt, "All", evaluate_model(all_model, test_data))
+
+simple_fields = ["commonAuthors", "prefAttachment"]
+simple_model = train_model(simple_fields, training_data)
+add_curve(plt, "Simple", evaluate_model(simple_model, test_data))
+
+
+some_fields = ["commonAuthors", "totalNeighbours", "prefAttachment", "sameLouvain",
+               "minTriangles", "maxTriangles", "minCoefficient", "maxCoefficient",
+               "samePartition", "jaccard"]
+some_model = train_model(some_fields, training_data)
+add_curve(plt, "Some", evaluate_model(some_model, test_data))
+
+plt.legend(loc='lower right')
+fig.savefig('roc_curves_big_dataset_test.png')
+plt.show()

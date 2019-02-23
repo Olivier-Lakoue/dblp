@@ -1,8 +1,12 @@
+CREATE INDEX ON :Article(index);
+CREATE INDEX ON :Author(name);
+
+
 CALL apoc.periodic.iterate(
   'UNWIND ["dblp-ref-0.json","dblp-ref-1.json","dblp-ref-2.json","dblp-ref-3.json"] as file
    CALL apoc.load.json("file:///home/markhneedham/projects/dblp/dblp-ref/" + file)
    yield value
-   WHERE value.venue = "Lecture Notes in Computer Science"
+   WHERE value.venue IN ["Lecture Notes in Computer Science", "Communications of The ACM", "international conference on software engineering", "advances in computing and communications"]
    return value',
   'MERGE (a:Article{index:value.id})
    ON CREATE SET a += apoc.map.clean(value,["id","authors","references"],[0])
@@ -12,6 +16,17 @@ CALL apoc.periodic.iterate(
    MERGE (b)<-[:AUTHOR]-(a)'
 ,{batchSize: 10000, iterateList: true});
 
+CALL apoc.periodic.iterate(
+  'UNWIND ["dblp-ref-0.json","dblp-ref-1.json","dblp-ref-2.json","dblp-ref-3.json"] as file
+   CALL apoc.load.json("file:///home/markhneedham/projects/dblp/dblp-ref/" + file)
+   yield value
+   WHERE value.venue IN ["Lecture Notes in Computer Science", "Communications of The ACM", "international conference on software engineering", "advances in computing and communications"]
+   return value',
+  'MATCH (a:Article{index:value.id})
+   UNWIND value.references AS reference
+   MATCH (other:Article {index: reference})
+   MERGE (a)-[:CITES]->(other)'
+,{batchSize: 10000, iterateList: true});
 
 // Remove single article authors
 match (a:Author)<-[r:AUTHOR]-(art:Article {venue: "Lecture Notes in Computer Science"})
@@ -59,17 +74,17 @@ CALL apoc.periodic.iterate(
   SET coauthor.collaborations = collaborations',
   {});
 
-CALL apoc.periodic.iterate(
- 'MATCH (a1:Author)
-  RETURN a1',
- 'MATCH (a1)<-[:AUTHOR]-(paper)-[:AUTHOR]->(a2:Author)
-  WITH a1, a2, paper
-  ORDER BY a1, paper.year
-  WITH a1, a2, collect(paper)[0].year AS year, count(*) AS collaborations
-  WHERE year >= 2006
-  MERGE (a1)-[coauthor:CO_AUTHOR_LATE {year: year}]-(a2)
-  SET coauthor.collaborations = collaborations',
-  {});
+ CALL apoc.periodic.iterate(
+  'MATCH (a1:Author)
+   RETURN a1',
+  'MATCH (a1)<-[:AUTHOR]-(paper)-[:AUTHOR]->(a2:Author)
+   WITH a1, a2, paper
+   ORDER BY a1, paper.year
+   WITH a1, a2, collect(paper)[0].year AS year, count(*) AS collaborations
+   WHERE year >= 2006
+   MERGE (a1)-[coauthor:CO_AUTHOR_LATE {year: year}]-(a2)
+   SET coauthor.collaborations = collaborations',
+   {});
 
 CALL db.index.explicit.forRelationships("coauthor");
 
