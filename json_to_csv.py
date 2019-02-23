@@ -17,7 +17,7 @@ with open("data/article_REFERENCES_article.csv", "w") as article_references_arti
 
     articles_references_article_writer = csv.writer(article_references_article_file, delimiter=",")
     article_author_author_file_writer = csv.writer(article_author_author_file, delimiter=",")
-    for file_path in glob.glob("dblp-ref/*.json")[0:]:
+    for file_path in glob.glob("dblp-ref/*.json"):
         with open(file_path, "r") as file:
             line = file.readline()
             while line:
